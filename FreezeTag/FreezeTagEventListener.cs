@@ -22,6 +22,16 @@ namespace FreezeTag
         private readonly Dictionary<IGame, FreezeTagInfos> CodeAndInfos = new Dictionary<IGame, FreezeTagInfos>();
         private readonly ILogger<FreezeTagPlugin> _logger;
 
+        private const string commandPrefix = "/ftag";
+        private const string gameModeExplanation = "Freeze Tag is a custom Among Us mode." +
+                        "\nImpostors are red, crewmates are green. The impostors can freeze the crewmates by standing near them." +
+                        "\nThe crewmates can unfreeze the frozen crewmates by standing near of them." +
+                        "\nObjective of the impostors: freeze everyone." +
+                        "\nObjective of the crewmates: finish all their tasks." +
+                        "\nIf a crewmate gets killed, the impostors get killed!";
+
+        private const float freezeRange = 0.2f;
+
         public FreezeTagEventListener(ILogger<FreezeTagPlugin> logger)
         {
             _logger = logger;
@@ -72,43 +82,46 @@ namespace FreezeTag
                 ConcurrentDictionary<IClientPlayer, Vector2> frozens = CodeAndInfos[e.Game].frozens;
                 IEnumerable<IClientPlayer> crewmates = e.Game.Players.Except(impostors).Except(frozens.Keys);
 
-                if (!crewmates.Any())
-                {
-                    foreach (var nonImpostor in e.Game.Players.Except(impostors))
+                if (frozens.ContainsKey(e.ClientPlayer)) {
+                    if (frozens.TryGetValue(e.ClientPlayer, out var position))
                     {
-                        await nonImpostor.KickAsync();
+                        await e.ClientPlayer.Character.NetworkTransform.SnapToAsync(position);
                     }
+                    else {
+                        _logger.LogWarning($"[FTag] Could not read position from ConcurrentDictionary for frozen player: {e.ClientPlayer.Character.PlayerInfo.PlayerName} in {e.Game.Code}");
+                    }
+                    return;
                 }
 
-                foreach (var impostor in impostors)
-                {
-                    if (impostor.Character != null)
+                if (crewmates.Contains(e.ClientPlayer)) {
+                    var sun = e.ClientPlayer;
+                    foreach (var pair in frozens)
                     {
-                        foreach (var crewmate in crewmates)
+                        IClientPlayer frozen = pair.Key;
+                        Vector2 position = pair.Value;
+                        if (sun != frozen && CheckIfColliding(sun, frozen))
                         {
-                            if (CheckIfColliding(crewmate, impostor))
-                            {
-                                frozens.TryAdd(crewmate, crewmate.Character.NetworkTransform.Position);
-                                await crewmate.Character.SetColorAsync(ColorType.Blue);
-                            }
+                            await Unfreeze(frozen).ConfigureAwait(true);
+                            frozens.Remove(frozen, out _);
                         }
                     }
                 }
 
-                foreach (var pair in frozens)
-                {
-                    IClientPlayer frozen = pair.Key;
-                    Vector2 position = pair.Value;
-                    if (frozen.Character.NetworkTransform.Position != position)
+                if (impostors.Contains(e.ClientPlayer)) {
+                    var impostor = e.ClientPlayer;
+                    foreach (var crewmate in crewmates)
                     {
-                        await frozen.Character.NetworkTransform.SnapToAsync(position);
-                    }
-                    foreach (var sun in crewmates)
-                    {
-                        if (sun != frozen && CheckIfColliding(sun, frozen))
+                        if (CheckIfColliding(crewmate, impostor))
                         {
-                            await Unfreeze(frozen).ConfigureAwait(true);
-                            frozens.Remove(frozen, out position);
+                            frozens.TryAdd(crewmate, crewmate.Character.NetworkTransform.Position);
+                            await crewmate.Character.SetColorAsync(ColorType.Blue);
+                            if (!crewmates.Any())
+                            {
+                                foreach (var nonImpostor in e.Game.Players.Except(impostors))
+                                {
+                                    await nonImpostor.KickAsync();
+                                }
+                            }
                         }
                     }
                 }
@@ -123,11 +136,9 @@ namespace FreezeTag
             float crewmateY = (float)Math.Round(crewmatePos.Y, 1);
             float impostorX = (float)Math.Round(impostorPos.X, 1);
             float impostorY = (float)Math.Round(impostorPos.Y, 1);
-            if (crewmateX <= impostorX + 0.2 && crewmateX >= impostorX - 0.2 && crewmateY <= impostorY + 0.2 && crewmateY >= impostorY - 0.2)
-            {
-                return true;
-            }
-            return false;
+
+            return crewmateX <= impostorX + freezeRange && crewmateX >= impostorX - freezeRange
+                && crewmateY <= impostorY + freezeRange && crewmateY >= impostorY - freezeRange;
         }
 
         private async ValueTask Unfreeze(IClientPlayer frozen)
@@ -162,60 +173,57 @@ namespace FreezeTag
         [EventListener]
         public async ValueTask OnPlayerChat(IPlayerChatEvent e)
         {
-            if (e.Game.GameState == GameStates.NotStarted && e.Message.StartsWith("/ftag "))
+            if (e.Game.GameState != GameStates.NotStarted || !e.Message.StartsWith(commandPrefix))
             {
-                switch (e.Message.ToLowerInvariant()[6..])
-                {
-                    case "on":
-                        if (e.ClientPlayer.IsHost)
-                        {
-                            if (DeactivatedGames.Contains(e.Game))
-                            {
-                                DeactivatedGames.Remove(e.Game);
-                                await ServerSendChatAsync("Freeze Tag activated for this game.", e.ClientPlayer.Character);
-                            } else
-                            {
-                                await ServerSendChatAsync("Freeze Tag was already active.", e.ClientPlayer.Character);
-                            }
-                        } else
-                        {
-                            await ServerSendChatToPlayerAsync("You can't enable Freeze Tag because you aren't the host.", e.ClientPlayer.Character);
-                        }
+                return;
+            }
+
+            switch (e.Message.ToLowerInvariant()[($"{commandPrefix} ".Length)..])
+            {
+                case "on":
+                    if (!e.ClientPlayer.IsHost)
+                    {
+                        await ServerSendChatToPlayerAsync("[FF0000FF]You can't enable Freeze Tag because you aren't the host.", e.ClientPlayer.Character);
                         break;
-                    case "off":
-                        if (e.ClientPlayer.IsHost)
-                        {
-                            if (!DeactivatedGames.Contains(e.Game))
-                            {
-                                DeactivatedGames.Add(e.Game);
-                                await ServerSendChatAsync("Freeze Tag deactivated for this game.", e.ClientPlayer.Character);
-                            }
-                            else
-                            {
-                                await ServerSendChatAsync("Freeze Tag was already off.", e.ClientPlayer.Character);
-                            }
-                        }
-                        else
-                        {
-                            await ServerSendChatToPlayerAsync("You can't disable Freeze Tag because you aren't the host.", e.ClientPlayer.Character);
-                        }
+                    }
+
+                    if (DeactivatedGames.Contains(e.Game))
+                    {
+                        DeactivatedGames.Remove(e.Game);
+                        await ServerSendChatAsync("[00FF00FF]Freeze Tag activated for this game.", e.ClientPlayer.Character);
+                        await ServerSendChatAsync(gameModeExplanation, e.ClientPlayer.Character);
                         break;
-                    case "help":
-                        await ServerSendChatToPlayerAsync("Freeze Tag is a custom Among Us mode.", e.ClientPlayer.Character);
-                        await ServerSendChatToPlayerAsync("Impostors are red, crewmates are green. The impostors can freeze the crewmates by standing near them.", e.ClientPlayer.Character);
-                        await ServerSendChatToPlayerAsync("The crewmates can unfreeze the frozen crewmates by standing near of them.", e.ClientPlayer.Character);
-                        await ServerSendChatToPlayerAsync("Objective of the impostors: freeze everyone.", e.ClientPlayer.Character);
-                        await ServerSendChatToPlayerAsync("Objective of the crewmates: finish all their tasks.", e.ClientPlayer.Character);
-                        await ServerSendChatToPlayerAsync("If a crewmate gets killed, the impostors get killed!", e.ClientPlayer.Character);
+                    } 
+
+                    await ServerSendChatAsync("[FFA500FF]Freeze Tag was already active.", e.ClientPlayer.Character);                    
+                    break;
+                case "off":
+                    if (!e.ClientPlayer.IsHost)
+                    {
+                        await ServerSendChatToPlayerAsync("[FF0000FF]You can't disable Freeze Tag because you aren't the host.", e.ClientPlayer.Character);
                         break;
-                }
+                    }
+
+                    if (!DeactivatedGames.Contains(e.Game))
+                    {
+                        DeactivatedGames.Add(e.Game);
+                        await ServerSendChatAsync("[00FF00FF]Freeze Tag deactivated for this game.", e.ClientPlayer.Character);
+                        break;
+                    }
+
+                    await ServerSendChatAsync("[FFA500FF]Freeze Tag was already off.", e.ClientPlayer.Character);    
+                    break;
+                case "":
+                case "help":
+                    await ServerSendChatToPlayerAsync(gameModeExplanation, e.ClientPlayer.Character);
+                    break;
             }
         }
 
         private async ValueTask ServerSendChatAsync(string text, IInnerPlayerControl player)
         {
             string playername = player.PlayerInfo.PlayerName;
-            await player.SetNameAsync($"PublicMsg");
+            await player.SetNameAsync($"FreezeTag");
             await player.SendChatAsync($"{text}");
             await player.SetNameAsync(playername);
         }
@@ -223,7 +231,7 @@ namespace FreezeTag
         private async ValueTask ServerSendChatToPlayerAsync(string text, IInnerPlayerControl player)
         {
             string playername = player.PlayerInfo.PlayerName;
-            await player.SetNameAsync($"PrivateMsg");
+            await player.SetNameAsync($"FreezeTagPrivate");
             await player.SendChatToPlayerAsync($"{text}");
             await player.SetNameAsync(playername);
         }
